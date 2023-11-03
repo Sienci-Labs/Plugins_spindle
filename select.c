@@ -333,7 +333,15 @@ static void spindle_settings_restore (void)
     do {
         idx--;
         spindle_setting[idx].spindle_id = idx == 0 ? 0 : -1;
+        #if BOARD_LONGBOARD32
+        //set SPINDLE 1 to onboard PWM spindle (spindle ID 0)
+        if (idx == 1)
+            spindle_setting[idx].spindle_id = 0;
+        #endif
         spindle_setting[idx].min_tool_id = 0;
+
+
+
     } while(idx);
 
     hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&spindle_setting, sizeof(spindle_setting), true);
