@@ -335,6 +335,9 @@ static void spindle_settings_restore (void)
         spindle_setting[idx].spindle_id = idx == 0 ? 0 : -1;
         #if BOARD_LONGBOARD32
         //set SPINDLE 1 to onboard PWM spindle (spindle ID 0)
+        if(idx == 0)
+            spindle_setting[idx].spindle_id = SLB_DEFAULT_SPINDLE;
+
         if (idx == 1)
             spindle_setting[idx].spindle_id = 0;
         #endif
@@ -354,7 +357,11 @@ static void spindle_settings_load (void)
     if(hal.nvs.memcpy_from_nvs((uint8_t *)&spindle_setting, nvs_address, sizeof(spindle_setting), true) != NVS_TransferResult_OK)
         spindle_settings_restore();
 
+    #if BOARD_LONGBOARD32
+    spindle_setting[0].spindle_id = SLB_DEFAULT_SPINDLE; // always default spindle!
+    #else
     spindle_setting[0].spindle_id = 0; // always default spindle!
+    #endif
 
 #if N_SYS_SPINDLE == 1
 
