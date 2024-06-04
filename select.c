@@ -336,13 +336,13 @@ static void spindle_settings_restore (void)
         #if BOARD_LONGBOARD32
         //set SPINDLE 0 to onboard PWM spindle (spindle ID 0)
         if(idx == 0)
-            spindle_setting[idx].spindle_id = 0;
+            spindle_setting[idx].spindle_id = SLB_DEFAULT_SPINDLE;
         //set SPINDLE 1 to onboard PWM spindle 2 (spindle ID 1)
         if (idx == 1)
             spindle_setting[idx].spindle_id = SLB_LASER_SPINDLE;
 
         //set enabled VFD driver to MODVFD (spindle ID 5)
-        if (idx == 3)
+        if (idx == 2)
             spindle_setting[idx].spindle_id = SLB_DEFAULT_VFD;            
         #endif
         spindle_setting[idx].min_tool_id = 0;
@@ -362,7 +362,7 @@ static void spindle_settings_load (void)
         spindle_settings_restore();
 
     #if BOARD_LONGBOARD32
-    spindle_setting[0].spindle_id = 0; // always default spindle!
+    spindle_setting[0].spindle_id = SLB_DEFAULT_SPINDLE; // always default spindle!
     #else
     spindle_setting[0].spindle_id = 0; // always default spindle!
     #endif

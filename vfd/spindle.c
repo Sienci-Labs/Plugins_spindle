@@ -323,6 +323,12 @@ static void vfd_settings_restore (void)
     vfd_config.out_multiplier = 60;
     vfd_config.out_divider = 100;
 
+#if BOARD_LONGBOARD32
+    #ifdef SLB_DEFAULT_VFD_ADDRESS
+    vfd_config.modbus_address[0] = SLB_DEFAULT_VFD_ADDRESS;
+    #endif
+#endif
+
     hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&vfd_config, sizeof(vfd_settings_t), true);
 }
 
