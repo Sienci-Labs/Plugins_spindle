@@ -4,26 +4,26 @@
 
   Part of grblHAL
 
-  Copyright (c) 2020-2023 Terje Io
+  Copyright (c) 2020-2024 Terje Io
 
-  Grbl is free software: you can redistribute it and/or modify
+  grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation, either version 3 of the License, or
   (at your option) any later version.
 
-  Grbl is distributed in the hope that it will be useful,
+  grblHAL is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
   GNU General Public License for more details.
 
   You should have received a copy of the GNU General Public License
-  along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
+  along with grblHAL. If not, see <http://www.gnu.org/licenses/>.
 
 */
 
 #include "../shared.h"
 
-#if VFD_ENABLE == SPINDLE_ALL || VFD_ENABLE == SPINDLE_HUANYANG1
+#if SPINDLE_ENABLE & (1<<SPINDLE_HUANYANG1)
 
 #include <math.h>
 #include <string.h>
@@ -36,10 +36,9 @@ static spindle_id_t spindle_id = -1;
 static spindle_ptrs_t *spindle_hal = NULL;
 static spindle_state_t vfd_state = {0};
 static spindle_data_t spindle_data = {0};
-static spindle_get_data_ptr on_get_data = NULL;
 static on_report_options_ptr on_report_options;
-static on_spindle_select_ptr on_spindle_select;
 static on_spindle_selected_ptr on_spindle_selected;
+static settings_changed_ptr settings_changed;
 static driver_reset_ptr driver_reset;
 
 static void rx_packet (modbus_message_t *msg);
@@ -116,7 +115,7 @@ static void spindleGetMaxAmps (void)
 
 static void spindleSetRPM (float rpm, bool block)
 {
-    if (rpm != spindle_data.rpm_programmed) {
+    if(rpm != spindle_data.rpm_programmed) {
 
         uint32_t data = lroundf(rpm * 5000.0f / (float)rpm_at_50Hz); // send Hz * 10  (Ex:1500 RPM = 25Hz .... Send 2500)
 
@@ -132,26 +131,24 @@ static void spindleSetRPM (float rpm, bool block)
             .rx_length = 6
         };
 
-        vfd_state.at_speed = false;
-
         modbus_send(&rpm_cmd, &callbacks, block);
 
-        if(settings.spindle.at_speed_tolerance > 0.0f) {
-            spindle_data.rpm_low_limit = rpm * (1.0f - (settings.spindle.at_speed_tolerance / 100.0f));
-            spindle_data.rpm_high_limit = rpm * (1.0f + (settings.spindle.at_speed_tolerance / 100.0f));
-        }
-        spindle_data.rpm_programmed = rpm;
+        spindle_set_at_speed_range(spindle_hal, &spindle_data, rpm);
     }
 }
 
-static void spindleUpdateRPM (float rpm)
+static void spindleUpdateRPM (spindle_ptrs_t *spindle, float rpm)
 {
+    UNUSED(spindle);
+
     spindleSetRPM(rpm, false);
 }
 
 // Start or stop spindle
-static void spindleSetState (spindle_state_t state, float rpm)
+static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
 {
+    UNUSED(spindle);
+
     modbus_message_t mode_cmd = {
         .context = (void *)VFD_SetStatus,
         .crc_check = false,
@@ -174,7 +171,7 @@ static void spindleSetState (spindle_state_t state, float rpm)
 }
 
 // Returns spindle state in a spindle_state_t variable
-static spindle_state_t spindleGetState (void)
+static spindle_state_t spindleGetState (spindle_ptrs_t *spindle)
 {
     modbus_message_t rpm_cmd = {
         .context = (void *)VFD_GetRPM,
@@ -201,11 +198,7 @@ static spindle_state_t spindleGetState (void)
     };
     modbus_send(&amps_cmd, &callbacks, false); // TODO: add flag for not raising alarm?
 
-    // Get the actual RPM from spindle encoder input when available.
-    if(on_get_data) {
-        float rpm = on_get_data(SpindleData_RPM)->rpm;
-        vfd_state.at_speed = settings.spindle.at_speed_tolerance <= 0.0f || (rpm >= spindle_data.rpm_low_limit && rpm <= spindle_data.rpm_high_limit);
-    }
+    vfd_state.at_speed = spindle->get_data(SpindleData_AtSpeed)->state_programmed.at_speed;
 
     return vfd_state; // return previous state as we do not want to wait for the response
 }
@@ -217,8 +210,7 @@ static void rx_packet (modbus_message_t *msg)
         switch((vfd_response_t)msg->context) {
 
             case VFD_GetRPM:
-                spindle_data.rpm = (float)((msg->adu[4] << 8) | msg->adu[5]) * rpm_at_50Hz / 5000.0f;
-                vfd_state.at_speed = settings.spindle.at_speed_tolerance <= 0.0f || (spindle_data.rpm >= spindle_data.rpm_low_limit && spindle_data.rpm <= spindle_data.rpm_high_limit);
+                spindle_validate_at_speed(spindle_data, (float)((msg->adu[4] << 8) | msg->adu[5]) * rpm_at_50Hz / 5000.0f);
                 break;
 
             case VFD_GetMinRPM:
@@ -264,20 +256,6 @@ static float spindleGetLoad (void)
 
 static spindle_data_t *spindleGetData (spindle_data_request_t request)
 {
-    if(on_get_data) {
-
-        spindle_data_t *data;
-
-        data = on_get_data(request);
-        data->rpm_low_limit = spindle_data.rpm_low_limit;
-        data->rpm_high_limit = spindle_data.rpm_high_limit;
-        data->rpm_programmed = spindle_data.rpm_programmed;
-        data->state_programmed.on = spindle_data.state_programmed.on;
-        data->state_programmed.ccw = spindle_data.state_programmed.ccw;
-
-        return data;
-    }
-
     return &spindle_data;
 }
 
@@ -293,7 +271,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        hal.stream.write("[PLUGIN:HUANYANG VFD v0.11]" ASCII_EOL);
+        report_plugin("HUANYANG VFD", "0.12");
 }
 
 static void onDriverReset (void)
@@ -307,22 +285,14 @@ static void onDriverReset (void)
     }
 }
 
-static bool onSpindleSelect (spindle_ptrs_t *spindle)
-{
-    if(spindle->id == spindle_id) {
-        on_get_data = spindle->get_data;
-        spindle->get_data = spindleGetData;
-    }
-
-    return on_spindle_select == NULL || on_spindle_select(spindle);
-}
-
 static void onSpindleSelected (spindle_ptrs_t *spindle)
 {
     if(spindle->id == spindle_id) {
 
         spindle_hal = spindle;
         spindle_data.rpm_programmed = -1.0f;
+        spindle_data.at_speed_enabled = settings.spindle.at_speed_tolerance >= 0.0f;
+        spindle->at_speed_tolerance = settings.spindle.at_speed_tolerance;
 
         modbus_set_silence(&silence);
         modbus_address = vfd_get_modbus_address(spindle_id);
@@ -337,27 +307,47 @@ static void onSpindleSelected (spindle_ptrs_t *spindle)
         on_spindle_selected(spindle);
 }
 
+static void settingsChanged (settings_t *settings, settings_changed_flags_t changed)
+{
+    settings_changed(settings, changed);
+
+    if(changed.spindle) {
+
+        spindle_ptrs_t *spindle = spindle_get_hal(spindle_id, SpindleHAL_Configured);
+
+        spindle->at_speed_tolerance = settings->spindle.at_speed_tolerance;
+        spindle_data.at_speed_enabled = settings->spindle.at_speed_tolerance >= 0.0f;
+    }
+}
+
 void vfd_huanyang_init (void)
 {
-    static const vfd_spindle_ptrs_t spindle = {
-        .spindle.type = SpindleType_VFD,
-        .spindle.cap.variable = On,
-        .spindle.cap.at_speed = On,
-        .spindle.cap.direction = On,
-        .spindle.config = spindleConfig,
-        .spindle.set_state = spindleSetState,
-        .spindle.get_state = spindleGetState,
-        .spindle.update_rpm = spindleUpdateRPM,
+    static const vfd_spindle_ptrs_t vfd = {
+        .spindle = {
+            .type = SpindleType_VFD,
+            .ref_id = SPINDLE_HUANYANG1,
+            .cap = {
+                .variable = On,
+                .at_speed = On,
+                .direction = On,
+                .cmd_controlled = On
+            },
+            .config = spindleConfig,
+            .set_state = spindleSetState,
+            .get_state = spindleGetState,
+            .update_rpm = spindleUpdateRPM,
+            .get_data = spindleGetData,
+        },
         .vfd.get_load = spindleGetLoad
     };
 
-    if((spindle_id = vfd_register(&spindle, "Huanyang v1")) != -1) {
-
-        on_spindle_select = grbl.on_spindle_select;
-        grbl.on_spindle_select = onSpindleSelect;
+    if((spindle_id = vfd_register(&vfd, "Huanyang v1")) != -1) {
 
         on_spindle_selected = grbl.on_spindle_selected;
         grbl.on_spindle_selected = onSpindleSelected;
+
+        settings_changed = hal.settings_changed;
+        hal.settings_changed = settingsChanged;
 
         on_report_options = grbl.on_report_options;
         grbl.on_report_options = onReportOptions;

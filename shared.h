@@ -29,14 +29,6 @@
 #include "driver.h"
 #endif
 
-#define SPINDLE_ALL        -1
-#define SPINDLE_MODVFD      1
-#define SPINDLE_HUANYANG1   2
-#define SPINDLE_HUANYANG2   3
-#define SPINDLE_GS20        4
-#define SPINDLE_YL620A      5
-#define SPINDLE_H100        6 // Not tested
-
 int8_t spindle_select_get_binding (spindle_id_t spindle_id);
 
 /**/

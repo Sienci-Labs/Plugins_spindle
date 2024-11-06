@@ -4,22 +4,22 @@
 
   Part of grblHAL
 
-  Copyright (c) 2020-2023 Terje Io
+  Copyright (c) 2020-2024 Terje Io
   except modbus_CRC16x which is Copyright (c) 2006 Christian Walter <wolti@sil.at>
   Lifted from his FreeModbus Libary
 
-  Grbl is free software: you can redistribute it and/or modify
+  grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation, either version 3 of the License, or
   (at your option) any later version.
 
-  Grbl is distributed in the hope that it will be useful,
+  grblHAL is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
   GNU General Public License for more details.
 
   You should have received a copy of the GNU General Public License
-  along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
+  along with grblHAL. If not, see <http://www.gnu.org/licenses/>.
 
 */
 
@@ -50,8 +50,12 @@
 #ifndef MODBUS_BAUDRATE
 #define MODBUS_BAUDRATE 3 // 19200
 #endif
-#ifndef MODBUS_SERIAL_PORT
-#define MODBUS_SERIAL_PORT -1
+#ifndef MODBUS_RTU_STREAM
+#ifdef MODBUS_SERIAL_PORT
+#define MODBUS_RTU_STREAM MODBUS_SERIAL_PORT // Use deprecated definition
+#else
+#define MODBUS_RTU_STREAM -1
+#endif
 #endif
 #ifndef MODBUS_DIR_AUX
 #define MODBUS_DIR_AUX    -1
@@ -90,7 +94,6 @@ static uint8_t dir_port;
 #endif
 
 static driver_reset_ptr driver_reset;
-static on_execute_realtime_ptr on_execute_realtime, on_execute_delay;
 static on_report_options_ptr on_report_options;
 static nvs_address_t nvs_address;
 
@@ -140,13 +143,10 @@ static inline void add_message (queue_entry_t *packet, modbus_message_t *msg, co
     }
 }
 
-static void modbus_poll (void)
+// called once every ms
+static void modbus_poll (void *data)
 {
-    static uint32_t last_ms;
-
-    uint32_t ms = hal.get_elapsed_ticks();
-
-    if(ms == last_ms || spin_lock) // check once every ms
+    if(spin_lock)
         return;
 
     spin_lock = true;
@@ -171,7 +171,7 @@ static void modbus_poll (void)
             break;
 
         case ModBus_Silent:
-            if(ms >= silence_until) {
+            if(hal.get_elapsed_ticks() >= silence_until) {
                 silence_until = 0;
                 state = ModBus_Idle;
             }
@@ -198,83 +198,75 @@ static void modbus_poll (void)
                 if(packet->async) {
                     state = ModBus_Silent;
                     packet = NULL;
-                } else if(stream.read() == 1 && (stream.read() & 0x80)) {
+                } else if(stream.read() == packet->msg.adu[0] && (stream.read() & 0x80)) {
                     exception_code = stream.read();
                     state = ModBus_Exception;
                 } else
                     state = ModBus_Timeout;
                 spin_lock = false;
                 if(state != ModBus_AwaitReply)
-                    silence_until = ms + silence_timeout;
+                    silence_until = hal.get_elapsed_ticks() + silence_timeout;
                 return;
             }
 
             if(stream.get_rx_buffer_count() >= packet->msg.rx_length) {
 
                 char *buf = ((queue_entry_t *)packet)->msg.adu;
-
-                uint16_t rx_len = packet->msg.rx_length;        // store original length for CRC check
+                uint16_t rx_len = packet->msg.rx_length; // store original length for CRC check
 
                 do {
                     *buf++ = stream.read();
                 } while(--packet->msg.rx_length);
 
-                if (packet->msg.crc_check) {
+                if(packet->msg.crc_check) {
                     uint_fast16_t crc = modbus_CRC16x(((queue_entry_t *)packet)->msg.adu, rx_len - 2);
 
-                    if (packet->msg.adu[rx_len-2] != (crc & 0xFF) || packet->msg.adu[rx_len-1] != (crc >>8)) {
+                    if(packet->msg.adu[rx_len - 2] != (crc & 0xFF) || packet->msg.adu[rx_len - 1] != (crc >> 8)) {
                         // CRC check error
                         if((state = packet->async ? ModBus_Silent : ModBus_Exception) == ModBus_Silent) {
                             if(packet->callbacks.on_rx_exception)
                                 packet->callbacks.on_rx_exception(0, packet->msg.context);
                             packet = NULL;
                         }
-                        silence_until = ms + silence_timeout;
+                        silence_until = hal.get_elapsed_ticks() + silence_timeout;
                         break;
                     }
-
                 }
 
                 if((state = packet->async ? ModBus_Silent : ModBus_GotReply) == ModBus_Silent) {
-                    if(packet->callbacks.on_rx_packet)
+                    if(packet->callbacks.on_rx_packet) {
+                        packet->msg.rx_length = rx_len;
                         packet->callbacks.on_rx_packet(&((queue_entry_t *)packet)->msg);
+                    }
                     packet = NULL;
                 }
 
-                silence_until = ms + silence_timeout;
+                silence_until = hal.get_elapsed_ticks() + silence_timeout;
             }
             break;
 
         case ModBus_Timeout:
-            state = ModBus_Silent;
-            silence_until = ms + silence_timeout;
+            if(packet->async)
+                state = ModBus_Silent;
+            silence_until = hal.get_elapsed_ticks() + silence_timeout;
             break;
 
         default:
             break;
     }
 
-    last_ms = ms;
     spin_lock = false;
-}
-
-static void modbus_poll_realtime (sys_state_t grbl_state)
-{
-    on_execute_realtime(grbl_state);
-
-    modbus_poll();
-}
-
-static void modbus_poll_delay (sys_state_t grbl_state)
-{
-    on_execute_delay(grbl_state);
-
-    modbus_poll();
 }
 
 bool modbus_send_rtu (modbus_message_t *msg, const modbus_callbacks_t *callbacks, bool block)
 {
     static queue_entry_t sync_msg = {0};
+
+    if(msg->tx_length > MODBUS_MAX_ADU_SIZE || msg->rx_length > MODBUS_MAX_ADU_SIZE) {
+        if(callbacks->on_rx_exception)
+            callbacks->on_rx_exception(0, msg->context);
+        return false;
+    }
 
     uint_fast16_t crc = modbus_CRC16x(msg->adu, msg->tx_length - 2);
 
@@ -366,7 +358,7 @@ static void modbus_reset (void)
     }
 
     while(state != ModBus_Idle)
-        modbus_poll();
+        modbus_poll(NULL);
 
     driver_reset();
 }
@@ -445,7 +437,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        hal.stream.write("[PLUGIN:MODBUS v0.14]" ASCII_EOL);
+        hal.stream.write("[PLUGIN:MODBUS v0.16]" ASCII_EOL);
 }
 
 static bool modbus_rtu_isup (void)
@@ -483,11 +475,6 @@ static bool stream_is_valid (const io_stream_t *stream)
                      stream->set_enqueue_rt_handler == NULL);
 }
 
-static void pos_failed (uint_fast16_t state)
-{
-    report_message("Modbus failed to initialize!", Message_Warning);
-}
-
 #if MODBUS_ENABLE & MODBUS_RTU_DIR_ENABLED
 static void modbus_set_direction (bool tx)
 {
@@ -499,8 +486,8 @@ static bool claim_stream (io_stream_properties_t const *sstream)
 {
     io_stream_t const *claimed = NULL;
 
-#if MODBUS_SERIAL_PORT >= 0
-    if(sstream->type == StreamType_Serial && sstream->instance == MODBUS_SERIAL_PORT) {
+#if MODBUS_RTU_STREAM >= 0
+    if(sstream->type == StreamType_Serial && sstream->instance == MODBUS_RTU_STREAM) {
 #else
     if(sstream->type == StreamType_Serial && sstream->flags.modbus_ready && !sstream->flags.claimed) {
 #endif
@@ -550,7 +537,7 @@ void modbus_rtu_init (void)
   #endif
 
     if(!(n_out > dir_port && ioport_claim(Port_Digital, Port_Output, &dir_port, "Modbus RX/TX direction"))) {
-        protocol_enqueue_rt_command(pos_failed);
+        protocol_enqueue_foreground_task(report_warning, "Modbus failed to initialize!");
         system_raise_alarm(Alarm_SelftestFailed);
         return;
     }
@@ -562,11 +549,7 @@ void modbus_rtu_init (void)
         driver_reset = hal.driver_reset;
         hal.driver_reset = modbus_reset;
 
-        on_execute_realtime = grbl.on_execute_realtime;
-        grbl.on_execute_realtime = modbus_poll_realtime;
-
-        on_execute_delay = grbl.on_execute_delay;
-        grbl.on_execute_delay = modbus_poll_delay;
+        task_add_systick(modbus_poll, NULL);
 
         on_report_options = grbl.on_report_options;
         grbl.on_report_options = onReportOptions;
@@ -586,7 +569,7 @@ void modbus_rtu_init (void)
         modbus_set_silence(NULL);
 
     } else {
-        protocol_enqueue_rt_command(pos_failed);
+        protocol_enqueue_foreground_task(report_warning, "Modbus failed to initialize!");
         system_raise_alarm(Alarm_SelftestFailed);
     }
 }
